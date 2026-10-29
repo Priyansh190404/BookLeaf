@@ -1,0 +1,122 @@
+openapi: 3.0.3
+info:
+  title: BookLeaf Author Support API
+  version: 1.0.0
+  description: |
+    Success responses are `{ "data": ... }`. Errors are `{ "error": { "code", "message", "details?" } }`.
+    Auth: httpOnly `bl_session` cookie (set by login) or `Authorization: Bearer <token>`.
+servers: [{ url: /api }]
+security: [{ cookieAuth: [] }, { bearerAuth: [] }]
+components:
+  securitySchemes:
+    cookieAuth: { type: apiKey, in: cookie, name: bl_session }
+    bearerAuth: { type: http, scheme: bearer }
+  schemas:
+    Error:
+      type: object
+      properties:
+        error:
+          type: object
+          properties: { code: { type: string }, message: { type: string }, details: {} }
+    Status: { type: string, enum: [Open, In Progress, Resolved, Closed] }
+    Priority: { type: string, enum: [Critical, High, Medium, Low] }
+    Category:
+      type: string
+      enum: [Royalty & Payments, ISBN & Metadata Issues, Printing & Quality, Distribution & Availability, Book Status & Production Updates, General Inquiry]
+    Message:
+      type: object
+      properties: { id: { type: string }, senderRole: { type: string, enum: [author, admin] }, senderName: { type: string }, body: { type: string }, isInternal: { type: boolean }, aiAssisted: { type: boolean }, createdAt: { type: string, format: date-time } }
+    Ticket:
+      description: Author view. Admins additionally receive authorId/authorName/authorEmail, category(+Source), priority(+Source), aiRationale, assignedTo(+Name), aiDraft, aiDraftStale.
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        ticketNumber: { type: integer }
+        subject: { type: string }
+        description: { type: string }
+        status: { $ref: '#/components/schemas/Status' }
+        bookId: { type: string, nullable: true }
+        bookTitle: { type: string, nullable: true }
+        attachments: { type: array, items: { type: object, properties: { id: { type: string }, filename: { type: string }, mimeType: { type: string }, sizeBytes: { type: integer }, createdAt: { type: string, format: date-time } } } }
+        createdAt: { type: string, format: date-time }
+        updatedAt: { type: string, format: date-time }
+        messages: { type: array, items: { $ref: '#/components/schemas/Message' } }
+  responses:
+    Unauthenticated: { description: Missing/invalid session, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+    Forbidden: { description: Role not allowed, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+    NotFound: { description: Not found (also returned for another author's ticket), content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+    Invalid: { description: Validation error (details lists field errors), content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+paths:
+  /auth/login:
+    post:
+      security: []
+      summary: Log in with email + password
+      requestBody: { required: true, content: { application/json: { schema: { type: object, required: [email, password], properties: { email: { type: string }, password: { type: string } } } } } }
+      responses: { '200': { description: Session returned; cookie set }, '400': { $ref: '#/components/responses/Invalid' }, '401': { description: Incorrect email or password }, '429': { description: Too many failed attempts (5 per 15 min per IP+email) } }
+  /auth/logout: { post: { summary: Clear session cookie, responses: { '200': { description: OK } } } }
+  /auth/me: { get: { summary: Current session, responses: { '200': { description: Session }, '401': { $ref: '#/components/responses/Unauthenticated' } } } }
+  /health: { get: { security: [], summary: Liveness, responses: { '200': { description: OK } } } }
+  /books:
+    get:
+      summary: 'Books with royalty details (authors: own; admins must pass authorId)'
+      parameters: [{ name: authorId, in: query, schema: { type: string }, description: Admin only }]
+      responses: { '200': { description: Array of books }, '400': { $ref: '#/components/responses/Invalid' } }
+  /tickets:
+    get:
+      summary: 'List tickets (authors: own only; admins: all)'
+      parameters:
+        - { name: status, in: query, schema: { $ref: '#/components/schemas/Status' } }
+        - { name: category, in: query, schema: { $ref: '#/components/schemas/Category' } }
+        - { name: priority, in: query, schema: { $ref: '#/components/schemas/Priority' } }
+        - { name: assigned, in: query, schema: { type: string, enum: [me, unassigned] } }
+        - { name: from, in: query, schema: { type: string, format: date } }
+        - { name: to, in: query, schema: { type: string, format: date } }
+        - { name: q, in: query, schema: { type: string } }
+        - { name: sort, in: query, schema: { type: string, enum: [urgency, newest, oldest], default: urgency } }
+        - { name: limit, in: query, schema: { type: integer, default: 25, maximum: 200 } }
+        - { name: offset, in: query, schema: { type: integer, default: 0 } }
+        - { name: include, in: query, schema: { type: string, enum: [messages] } }
+      responses: { '200': { description: '{ data: Ticket[], meta: { total, limit, offset } }' }, '400': { $ref: '#/components/responses/Invalid' } }
+    post:
+      summary: Create a ticket (author). Triggers AI classification + priority; never fails because of AI.
+      requestBody: { required: true, content: { application/json: { schema: { type: object, required: [subject, description], properties: { bookId: { type: string, nullable: true, description: Omit for General / Account Level }, subject: { type: string, minLength: 5, maxLength: 150 }, description: { type: string, minLength: 20, maxLength: 5000 } } } } } }
+      responses: { '201': { description: Created }, '400': { $ref: '#/components/responses/Invalid' }, '403': { $ref: '#/components/responses/Forbidden' } }
+  /tickets/summary:
+    get: { summary: 'Admin headline counts over all tickets', responses: { '200': { description: '{ unresolved, critical, overdue, unassigned }' }, '403': { $ref: '#/components/responses/Forbidden' } } }
+  /tickets/{id}/attachments:
+    parameters: [{ name: id, in: path, required: true, schema: { type: string, format: uuid } }]
+    post:
+      summary: 'Upload one file (author only). Type detected from content: PNG, JPEG, GIF, WebP, PDF; max 5 MB; max 5 per ticket.'
+      requestBody: { required: true, content: { multipart/form-data: { schema: { type: object, required: [file], properties: { file: { type: string, format: binary } } } } } }
+      responses: { '201': { description: Attachment metadata }, '409': { description: Limit reached or ticket closed }, '413': { description: File too large }, '415': { description: Unsupported file type } }
+  /tickets/{id}/attachments/{attId}:
+    parameters: [{ name: id, in: path, required: true, schema: { type: string, format: uuid } }, { name: attId, in: path, required: true, schema: { type: string, format: uuid } }]
+    get: { summary: Download or preview an attachment (owner author or admin), responses: { '200': { description: File bytes }, '404': { $ref: '#/components/responses/NotFound' } } }
+  /tickets/{id}:
+    parameters: [{ name: id, in: path, required: true, schema: { type: string, format: uuid } }]
+    get: { summary: Ticket + thread (internal notes only for admins), responses: { '200': { description: Ticket }, '404': { $ref: '#/components/responses/NotFound' } } }
+    patch:
+      summary: Admin update (status, category, priority, assignment)
+      requestBody: { required: true, content: { application/json: { schema: { type: object, properties: { status: { $ref: '#/components/schemas/Status' }, category: { $ref: '#/components/schemas/Category' }, priority: { $ref: '#/components/schemas/Priority' }, assignedTo: { type: string, nullable: true, enum: [me], description: '"me" assigns to caller; null unassigns' } } } } } }
+      responses: { '200': { description: Updated ticket }, '400': { $ref: '#/components/responses/Invalid' }, '403': { $ref: '#/components/responses/Forbidden' } }
+  /tickets/{id}/messages:
+    parameters: [{ name: id, in: path, required: true, schema: { type: string, format: uuid } }]
+    post:
+      summary: Public reply (author follow-up or admin response). 409 if author replies to a Closed ticket.
+      requestBody: { required: true, content: { application/json: { schema: { type: object, required: [body], properties: { body: { type: string, maxLength: 5000 }, aiAssisted: { type: boolean } } } } } }
+      responses: { '201': { description: Updated ticket }, '409': { description: Ticket closed } }
+  /tickets/{id}/notes:
+    parameters: [{ name: id, in: path, required: true, schema: { type: string, format: uuid } }]
+    post:
+      summary: Internal note (admin only; never visible to authors)
+      requestBody: { required: true, content: { application/json: { schema: { type: object, required: [body], properties: { body: { type: string } } } } } }
+      responses: { '201': { description: Updated ticket }, '403': { $ref: '#/components/responses/Forbidden' } }
+  /tickets/{id}/ai/draft:
+    parameters: [{ name: id, in: path, required: true, schema: { type: string, format: uuid } }]
+    post:
+      summary: Get cached or generate an AI-drafted reply (admin). Returns 200 with aiAvailable=false when the AI is down.
+      requestBody: { content: { application/json: { schema: { type: object, properties: { regenerate: { type: boolean } } } } } }
+      responses: { '200': { description: '{ draft, aiAvailable, reason?, stale }' } }
+  /tickets/{id}/ai/triage:
+    parameters: [{ name: id, in: path, required: true, schema: { type: string, format: uuid } }]
+    post: { summary: Re-run AI classification + priority (admin overrides preserved), responses: { '200': { description: '{ aiAvailable, ticket }' } } }
